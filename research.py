@@ -1,0 +1,356 @@
+from flask import Blueprint, jsonify, request
+import openai
+import requests
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
+import re
+import json
+from datetime import datetime
+
+research_bp = Blueprint('research', __name__)
+
+# Initialize OpenAI client
+client = openai.OpenAI()
+
+@research_bp.route('/search', methods=['POST'])
+def search_papers():
+    """
+    Initial search endpoint that takes a user query and returns results from PubMed and ArXiv
+    """
+    data = request.json
+    query = data.get('query', '')
+    
+    if not query:
+        return jsonify({'error': 'Query is required'}), 400
+    
+    try:
+        # Search PubMed
+        pubmed_results = search_pubmed(query)
+        
+        # Search ArXiv
+        arxiv_results = search_arxiv(query)
+        
+        # Combine results
+        all_results = {
+            'pubmed': pubmed_results,
+            'arxiv': arxiv_results,
+            'total_count': len(pubmed_results) + len(arxiv_results)
+        }
+        
+        return jsonify(all_results)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@research_bp.route('/refine_query', methods=['POST'])
+def refine_query():
+    """
+    Uses LLM to generate follow-up questions and refine the user's query
+    """
+    data = request.json
+    original_query = data.get('query', '')
+    context = data.get('context', '')
+    
+    if not original_query:
+        return jsonify({'error': 'Original query is required'}), 400
+    
+    try:
+        # Generate follow-up questions using OpenAI
+        prompt = f"""
+        You are a research assistant helping to refine academic search queries. 
+        
+        Original query: "{original_query}"
+        Context: {context}
+        
+        Generate 3-5 follow-up questions that would help clarify the user's research intent and make their search more specific and effective. 
+        Also suggest 2-3 refined query variations that might yield better results.
+        
+        Return your response as JSON with the following structure:
+        {{
+            "follow_up_questions": ["question1", "question2", ...],
+            "refined_queries": ["query1", "query2", ...],
+            "explanation": "Brief explanation of why these refinements would be helpful"
+        }}
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        
+        # Parse the JSON response
+        result = json.loads(response.choices[0].message.content)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def search_pubmed(query, max_results=20):
+    """
+    Search PubMed using NCBI E-utilities
+    """
+    try:
+        # Step 1: Search for PMIDs
+        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        search_params = {
+            'db': 'pubmed',
+            'term': query,
+            'retmax': max_results,
+            'retmode': 'json'
+        }
+        
+        search_response = requests.get(search_url, params=search_params)
+        search_data = search_response.json()
+        
+        pmids = search_data.get('esearchresult', {}).get('idlist', [])
+        
+        if not pmids:
+            return []
+        
+        # Step 2: Fetch details for the PMIDs
+        fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        fetch_params = {
+            'db': 'pubmed',
+            'id': ','.join(pmids),
+            'retmode': 'xml'
+        }
+        
+        fetch_response = requests.get(fetch_url, params=fetch_params)
+        
+        # Parse XML response
+        root = ET.fromstring(fetch_response.content)
+        
+        results = []
+        for article in root.findall('.//PubmedArticle'):
+            try:
+                # Extract title
+                title_elem = article.find('.//ArticleTitle')
+                title = title_elem.text if title_elem is not None else 'No title'
+                
+                # Extract abstract
+                abstract_elem = article.find('.//AbstractText')
+                abstract = abstract_elem.text if abstract_elem is not None else 'No abstract available'
+                
+                # Extract authors
+                authors = []
+                for author in article.findall('.//Author'):
+                    lastname = author.find('LastName')
+                    forename = author.find('ForeName')
+                    if lastname is not None and forename is not None:
+                        authors.append(f"{forename.text} {lastname.text}")
+                
+                # Extract publication date
+                pub_date = article.find('.//PubDate')
+                year = pub_date.find('Year').text if pub_date is not None and pub_date.find('Year') is not None else 'Unknown'
+                
+                # Extract PMID
+                pmid_elem = article.find('.//PMID')
+                pmid = pmid_elem.text if pmid_elem is not None else 'Unknown'
+                
+                # Extract journal
+                journal_elem = article.find('.//Journal/Title')
+                journal = journal_elem.text if journal_elem is not None else 'Unknown journal'
+                
+                results.append({
+                    'title': title,
+                    'abstract': abstract,
+                    'authors': authors,
+                    'year': year,
+                    'pmid': pmid,
+                    'journal': journal,
+                    'source': 'PubMed',
+                    'url': f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                })
+                
+            except Exception as e:
+                continue  # Skip articles with parsing errors
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error searching PubMed: {e}")
+        return []
+
+def search_arxiv(query, max_results=20):
+    """
+    Search ArXiv using their API
+    """
+    try:
+        # ArXiv API endpoint
+        base_url = "http://export.arxiv.org/api/query"
+        
+        # Prepare search parameters
+        params = {
+            'search_query': f'all:{query}',
+            'start': 0,
+            'max_results': max_results,
+            'sortBy': 'relevance',
+            'sortOrder': 'descending'
+        }
+        
+        response = requests.get(base_url, params=params)
+        
+        # Parse XML response
+        root = ET.fromstring(response.content)
+        
+        # Define namespace
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
+        
+        results = []
+        for entry in root.findall('atom:entry', ns):
+            try:
+                # Extract title
+                title_elem = entry.find('atom:title', ns)
+                title = title_elem.text.strip() if title_elem is not None else 'No title'
+                
+                # Extract abstract
+                summary_elem = entry.find('atom:summary', ns)
+                abstract = summary_elem.text.strip() if summary_elem is not None else 'No abstract available'
+                
+                # Extract authors
+                authors = []
+                for author in entry.findall('atom:author', ns):
+                    name_elem = author.find('atom:name', ns)
+                    if name_elem is not None:
+                        authors.append(name_elem.text)
+                
+                # Extract publication date
+                published_elem = entry.find('atom:published', ns)
+                published = published_elem.text[:4] if published_elem is not None else 'Unknown'  # Extract year
+                
+                # Extract ArXiv ID
+                id_elem = entry.find('atom:id', ns)
+                arxiv_id = id_elem.text.split('/')[-1] if id_elem is not None else 'Unknown'
+                
+                # Extract categories
+                categories = []
+                for category in entry.findall('atom:category', ns):
+                    term = category.get('term')
+                    if term:
+                        categories.append(term)
+                
+                results.append({
+                    'title': title,
+                    'abstract': abstract,
+                    'authors': authors,
+                    'year': published,
+                    'arxiv_id': arxiv_id,
+                    'categories': categories,
+                    'source': 'ArXiv',
+                    'url': f"https://arxiv.org/abs/{arxiv_id}"
+                })
+                
+            except Exception as e:
+                continue  # Skip entries with parsing errors
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error searching ArXiv: {e}")
+        return []
+
+
+
+@research_bp.route('/generate_report', methods=['POST'])
+def generate_report():
+    """
+    Generates a comprehensive research report with inline citations
+    """
+    data = request.json
+    selected_papers = data.get('papers', [])
+    query = data.get('query', '')
+    
+    if not selected_papers:
+        return jsonify({'error': 'No papers selected for report generation'}), 400
+    
+    try:
+        # Generate report using OpenAI
+        report_content = generate_research_report(selected_papers, query)
+        
+        return jsonify({
+            'report': report_content,
+            'citations': extract_citations(selected_papers),
+            'generated_at': str(datetime.now())
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def generate_research_report(papers, query):
+    """
+    Generate a comprehensive research report using LLM
+    """
+    # Prepare paper summaries for the LLM
+    paper_summaries = []
+    for i, paper in enumerate(papers, 1):
+        summary = f"""
+        [{i}] {paper.get('title', 'Unknown Title')}
+        Authors: {', '.join(paper.get('authors', []))}
+        Source: {paper.get('source', 'Unknown')}
+        Year: {paper.get('year', 'Unknown')}
+        Abstract: {paper.get('abstract', 'No abstract available')}
+        """
+        paper_summaries.append(summary)
+    
+    papers_text = "\n".join(paper_summaries)
+    
+    prompt = f"""
+    You are a research assistant tasked with writing a comprehensive research report based on the following academic papers related to the query: "{query}"
+
+    Papers to analyze:
+    {papers_text}
+
+    Please write a detailed research report that includes:
+    1. Executive Summary
+    2. Introduction and Background
+    3. Literature Review and Analysis
+    4. Key Findings and Insights
+    5. Methodological Approaches
+    6. Current Challenges and Limitations
+    7. Future Research Directions
+    8. Conclusion
+
+    Guidelines:
+    - Use inline citations in the format [1], [2], etc. referring to the paper numbers above
+    - Synthesize information across multiple papers
+    - Identify common themes, contradictions, and gaps in the literature
+    - Provide critical analysis, not just summaries
+    - Make the report comprehensive but accessible
+    - Ensure proper academic tone and structure
+    - Include specific details and findings from the papers
+    
+    The report should be substantial (2000-3000 words) and demonstrate deep understanding of the research area.
+    """
+    
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=4000
+    )
+    
+    return response.choices[0].message.content
+
+def extract_citations(papers):
+    """
+    Extract and format citations from the selected papers
+    """
+    citations = []
+    for i, paper in enumerate(papers, 1):
+        citation = {
+            'id': i,
+            'title': paper.get('title', 'Unknown Title'),
+            'authors': paper.get('authors', []),
+            'year': paper.get('year', 'Unknown'),
+            'source': paper.get('source', 'Unknown'),
+            'url': paper.get('url', ''),
+            'journal': paper.get('journal', ''),
+            'pmid': paper.get('pmid', ''),
+            'arxiv_id': paper.get('arxiv_id', '')
+        }
+        citations.append(citation)
+    
+    return citations
+
